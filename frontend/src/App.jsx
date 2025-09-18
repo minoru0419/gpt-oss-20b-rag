@@ -7,16 +7,9 @@ export default function App() {
   const [answer, setAnswer] = useState("");
   const [loading, setLoading] = useState(false);
   const [elapsed, setElapsed] = useState(null);
-  const [meta, setMeta] = useState({ mode: null, llm: null, sources: [] });
+  const [sources, setSources] = useState([]);
 
-  // 状態ログ
-  const [statusLog, setStatusLog] = useState([]);
   const askStartRef = useRef(null);
-
-  const pushStatus = (msg) => {
-    const t = new Date().toLocaleTimeString();
-    setStatusLog((prev) => [...prev, `[${t}] ${msg}`]);
-  };
 
   // ファイルアップロード
   const handleUpload = async () => {
@@ -28,16 +21,11 @@ export default function App() {
     formData.append("file", file);
 
     try {
-      pushStatus("アップロード開始");
       const res = await axios.post("http://127.0.0.1:8000/upload", formData);
-      pushStatus(
-        `アップロード完了: ${res.data.uploaded}（チャンク数: ${res.data.chunks}）`
-      );
-      alert("アップロード完了: " + res.data.uploaded);
+      alert(`アップロード完了: ${res.data.uploaded} (chunks=${res.data.chunks})`);
     } catch (err) {
       console.error(err);
-      pushStatus("アップロードに失敗しました");
-      alert("アップロードに失敗しました");
+      alert("アップロード失敗: " + (err.response?.data?.error || err.message));
     }
   };
 
@@ -51,34 +39,26 @@ export default function App() {
     try {
       setLoading(true);
       setAnswer("");
-      setMeta({ mode: null, llm: null, sources: [] });
+      setSources([]);
       setElapsed(null);
-      pushStatus("質問送信");
-
       askStartRef.current = performance.now();
 
       const res = await axios.post("http://127.0.0.1:8000/ask", formData);
 
-      const end = performance.now();
-      const sec = ((end - askStartRef.current) / 1000).toFixed(2);
+      const sec = ((performance.now() - askStartRef.current) / 1000).toFixed(2);
       setElapsed(sec);
-
       setAnswer(res.data.answer || "");
-      setMeta({
-        mode: res.data.mode || null,
-        llm: res.data.llm || null,
-        sources: Array.isArray(res.data.sources) ? res.data.sources : [],
-      });
+      setSources(res.data.sources || []);
 
-      pushStatus(
-        `応答受信（mode: ${res.data.mode || "-"}, llm: ${
-          res.data.llm || "-"
-        }, 時間: ${sec} 秒）`
-      );
     } catch (err) {
       console.error(err);
-      setAnswer("⚠️ エラーが発生しました");
-      pushStatus("質問処理でエラー発生");
+      let msg = "⚠️ エラーが発生しました";
+      if (err.response?.data?.error) {
+        msg = `⚠️ サーバーエラー: ${err.response.data.error}`;
+      } else if (err.message) {
+        msg = `⚠️ クライアントエラー: ${err.message}`;
+      }
+      setAnswer(msg);
     } finally {
       setLoading(false);
     }
@@ -88,7 +68,7 @@ export default function App() {
     <div className="p-8 max-w-3xl mx-auto font-sans space-y-6">
       <h1 className="text-3xl font-bold text-blue-600">📚 RAG WebUI</h1>
 
-      {/* アップロード行 */}
+      {/* ファイルアップロード */}
       <div className="flex items-center space-x-4">
         <input
           id="fileInput"
@@ -102,10 +82,7 @@ export default function App() {
         >
           ファイルを選択
         </label>
-        <span className="truncate max-w-[400px]">
-          {file ? file.name : "（未選択）"}
-        </span>
-        <div className="flex-1" />
+        <span>{file ? file.name : "（未選択）"}</span>
         <button
           onClick={handleUpload}
           className="px-4 h-[42px] bg-green-500 text-white rounded hover:bg-green-600"
@@ -115,7 +92,7 @@ export default function App() {
       </div>
 
       {/* 質問入力 */}
-      <div className="space-y-2">
+      <div>
         <textarea
           className="w-full border p-3 rounded"
           rows="3"
@@ -123,86 +100,33 @@ export default function App() {
           value={question}
           onChange={(e) => setQuestion(e.target.value)}
         />
-        <div className="flex items-center gap-3">
-          <button
-            onClick={handleAsk}
-            disabled={loading}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:opacity-50"
-          >
-            {loading ? "処理中..." : "質問する"}
-          </button>
-
-          {/* くるくるマーク */}
-          {loading && (
-            <div className="flex items-center gap-2 text-gray-600">
-              <svg
-                className="animate-spin h-5 w-5"
-                viewBox="0 0 24 24"
-                fill="none"
-              >
-                <circle
-                  className="opacity-25"
-                  cx="12"
-                  cy="12"
-                  r="10"
-                  stroke="currentColor"
-                  strokeWidth="4"
-                />
-                <path
-                  className="opacity-75"
-                  fill="currentColor"
-                  d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
-                />
-              </svg>
-              <span>サーバー処理中…</span>
-            </div>
-          )}
-        </div>
+        <button
+          onClick={handleAsk}
+          disabled={loading}
+          className="mt-2 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:opacity-50"
+        >
+          {loading ? "処理中..." : "質問する"}
+        </button>
       </div>
 
       {/* 回答表示 */}
       {answer && (
         <div className="p-4 border rounded bg-gray-50">
-          <h2 className="font-semibold mb-2 text-lg">AIの回答:</h2>
-          <pre className="whitespace-pre-wrap font-sans text-lg leading-relaxed">
-            {answer}
-          </pre>
-          <div className="mt-3 text-sm text-gray-600 space-y-1">
-            {elapsed && <div>⏱️ 回答時間: {elapsed} 秒</div>}
-            {meta.mode && <div>🧭 モード: {meta.mode}</div>}
-            {meta.llm && <div>🧠 モデル: {meta.llm}</div>}
-            {!!meta.sources?.length && (
-              <div>
-                📎 出典:
-                <ul className="list-disc ml-6">
-                  {meta.sources.map((s, i) => (
-                    <li key={`${s.source}-${s.page}-${i}`}>
-                      {s.source}
-                      {s.page != null ? `（p.${s.page}）` : ""}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-          </div>
+          <h2 className="font-semibold mb-2">AIの回答:</h2>
+          <pre className="whitespace-pre-wrap">{answer}</pre>
+          {elapsed && <div>⏱️ 回答時間: {elapsed} 秒</div>}
+          {sources.length > 0 && (
+            <div>
+              📎 出典:
+              <ul className="list-disc ml-6">
+                {sources.map((s, i) => (
+                  <li key={i}>{s.source} (chunk {s.chunk_id})</li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
-
-      {/* 状態ログ */}
-      <div className="p-4 border rounded bg-white">
-        <h3 className="font-semibold mb-2">🛠️ 動作の状態</h3>
-        {statusLog.length === 0 ? (
-          <p className="text-sm text-gray-500">まだイベントはありません。</p>
-        ) : (
-          <ul className="text-sm space-y-1 max-h-48 overflow-auto">
-            {statusLog.map((line, idx) => (
-              <li key={idx} className="whitespace-pre-wrap">
-                {line}
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
     </div>
   );
 }
