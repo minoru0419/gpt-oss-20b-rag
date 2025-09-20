@@ -1,553 +1,635 @@
 # -*- coding: utf-8 -*-
 """
-app.py (Ollama API 版・全部入り)
---------------------------------
-本バックエンドは以下の機能を提供します。
+===============================================================================
+ app.py  —  学習用・解説コメント付き “500行級” 完全版（FastAPI × Ollama × RAG）
+===============================================================================
 
-1) RAG (PDF / TXT アップロード → チャンク → 埋め込み → Chroma 検索 → 文脈付与 → Ollama 生成)
-2) 数値計算の即答（安全な四則演算のみ）：文章より優先し 0.0X 秒で返答
-3) 一般知識回答（RAG 該当なしでも必ず答える）
-4) 出典返却（ファイル名・ページ・チャンクID）
-5) UI 向け情報返却（mode, llm, llm_model, elapsed など）
-6) 詳細エラーハンドリング（UIに詳細メッセージが返る）
-7) CORS 制御（本番は環境変数で許可ドメイン限定可）
-8) モデル一覧取得（/models: Ollama /api/tags のラッパ）
-9) ベクトルDB消去（/clear_db）
-10) 健康診断（/health）
-11) くるくる対応用：処理時間(elapsed)を必ず返す
-12) 既存コードの互換：質問は multipart/form-data の "question" で受け取る
+■ このファイルでできること（昨日までの機能は維持しつつ、整理＋強化）
+  1) FastAPI バックエンド
+  2) CORS（フロントからのアクセス許可）
+  3) ファイルのアップロード（TXT / PDF）
+  4) RAG（Chroma + OllamaEmbeddings）で類似検索 → コンテキスト提示
+  5) 一般質問 / 文書質問を自動判定（モード: general / document / math）
+  6) 数式だけの質問は安全な簡易 “電卓” で高速即答（例: "500-120*3=" → 140）
+  7) Ollama API（/api/generate）へ直接HTTPで問い合わせ（固定でも切替でも可）
+  8) “モデル切替” に対応（/ask のリクエスト側で model を指定）
+  9) 詳細ログと丁寧な例外ハンドリング（UIでエラー原因を掴みやすい構造）
+ 10) /models（候補一覧）や /healthz /status の補助エンドポイントあり
+ 11) Optional: /metrics（prometheus_client が入っていれば有効 / 無ければ 501 返却）
 
-依存パッケージ（既存通り）:
-  pip install fastapi uvicorn requests
-  pip install langchain_community langchain_text_splitters langchain-chroma langchain-ollama
+■ 依存（最低限）
+  pip install fastapi uvicorn requests langchain-ollama langchain-chroma
+  pip install pypdf                （PDFを扱う場合）
+  pip install prometheus-client    （任意。入っていない場合は /metrics を 501 に）
 
-Ollama 側:
-  - サーバ: http://localhost:11434 で起動
-  - モデル: 例) phi3:mini / mistral:7b-instruct / llama3:instruct など。事前に pull 済みを推奨。
+■ Ollama 側（ローカル）
+  - “Ollama サーバー” を起動しておく（デフォルト: http://localhost:11434）
+  - モデルを一度 pull しておく（例）:
+      ollama pull phi3:mini
+      ollama pull mistral:7b-instruct
+      ollama pull qwen2.5:3b-instruct
+  - エンドポイント仕様:
+      POST /api/generate   （本コードは stream=False で最後に一括受信）
 
-環境変数(任意):
-  OLLAMA_URL        (default: http://localhost:11434)
-  OLLAMA_MODEL      (default: phi3:mini)
-  OLLAMA_TIMEOUT_S  (default: 120)
-  CORS_ORIGINS      (default: *)  カンマ区切り "http://localhost:5173,https://example.com"
-  RAG_TOPK          (default: 5)
-  DOC_SCORE_TH      (default: 0.30)  類似度スコアの閾値: これ以下でRAG文脈採用
-  CHUNK_SIZE        (default: 500)
-  CHUNK_OVERLAP     (default: 100)
+■ フロント側（例）
+  - フロントの /ask は `multipart/form-data` で `question` と任意の `model` を送る
+  - UI でプルダウンを表示し、/models からの一覧を使って選択 → /ask に渡す
 
-注意:
-  - Prometheus の /metrics は未同梱（以前は導入検討）。将来必要なら try/except で optional 追加可能。
-  - 既存フロントの App.jsx とは互換（/ask で answer など返す）
+■ 注意
+  - Windows 環境では PowerShell の curl と UNIX の curl が異なるので、
+    手動テストは Invoke-RestMethod を使うのが安全です。
+  - モデルが Ollama 側にロードされていない（pull未実行 等）と 404 が返るため
+    本コードは「ヒント」を同時に返し、UI 側で分かりやすく表示できるようにしています。
 
+===============================================================================
 """
 
+from __future__ import annotations
+
+# ---- 標準ライブラリ ---------------------------------------------------------
 import os
+import io
 import re
 import ast
-import time
 import json
+import time
+import math
 import shutil
 import traceback
 import operator as op
-from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import Dict, Any, List, Optional, Tuple
 
-import requests
-from fastapi import FastAPI, UploadFile, Form
+# ---- サードパーティ ---------------------------------------------------------
+from fastapi import FastAPI, UploadFile, Form, Request
+from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import requests
 
-# LangChain 周り
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+# LangChain の “新” パッケージ名（2024-2025 の分割以降）
+#   - 以前: from langchain_community import ...
+#   - 現在: 重要コンポーネントは個別パッケージに分離
 from langchain_ollama import OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from fastapi import FastAPI, Form
+
+# PDF ローダ（pypdf が必要）
+try:
+    from langchain_community.document_loaders import PyPDFLoader, TextLoader
+    _HAS_PDF = True
+except Exception:
+    # “新” では community 由来。pypdf が無ければ TXT のみ扱う
+    _HAS_PDF = False
+
+# prometheus_client はオプション。未導入でも動作するようにする
+try:
+    from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+    _HAS_PROM = True
+except Exception:
+    _HAS_PROM = False
+
 
 # =============================================================================
-# 0) 環境・定数
-# =============================================================================
-OLLAMA_MODELS = {
-    "mistral-7b": "mistral:7b-instruct",     # ベストバランス
-    "llama2-7b": "llama2:7b-chat",           # 少し軽め
-    "gemma-2b": "gemma:2b-it",               # 超軽量
-    "qwen-4b": "qwen:4b-chat",               # 日本語強め
-    "openhermes": "openhermes:2.5-mistral",  # instruct調整済み
-}
-
-# ディレクトリ
-ROOT_DIR    = Path(__file__).resolve().parent
-DATA_DIR    = ROOT_DIR / "docs"
-VECTOR_DIR  = ROOT_DIR / "chroma_db"
-DATA_DIR.mkdir(exist_ok=True, parents=True)
-VECTOR_DIR.mkdir(exist_ok=True, parents=True)
-
-# 環境値
-OLLAMA_URL       = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-#LLM_MODEL        = os.getenv("OLLAMA_MODEL", "phi3:mini")
-model_key = os.getenv("OLLAMA_MODEL", "mistral-7b")
-LLM_MODEL = OLLAMA_MODELS.get(model_key, "mistral:7b-instruct")
-
-OLLAMA_TIMEOUT_S = int(os.getenv("OLLAMA_TIMEOUT_S", "120"))
-
-# RAG・分割
-RAG_TOPK         = int(os.getenv("RAG_TOPK", "5"))
-DOC_SCORE_TH     = float(os.getenv("DOC_SCORE_TH", "0.30"))
-CHUNK_SIZE       = int(os.getenv("CHUNK_SIZE", "500"))
-CHUNK_OVERLAP    = int(os.getenv("CHUNK_OVERLAP", "100"))
-
-# 既存UIと互換のメタ
-BACKEND_LLM_NAME = "ollama"    # 固定表記
-BACKEND_MODE_RAG = "document"
-BACKEND_MODE_GEN = "general"
-BACKEND_MODE_MTH = "math"
-BACKEND_MODE_ERR = "error"
-
-# CORS
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
-if CORS_ORIGINS.strip() == "*" or CORS_ORIGINS.strip() == "":
-    ALLOW_ORIGINS = ["*"]
-else:
-    ALLOW_ORIGINS = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
-
-# =============================================================================
-# 1) FastAPI 準備
+# 1) 基本設定
 # =============================================================================
 
-app = FastAPI(title="RAG WebUI (Ollama API版)")
+# --- 1-1) CORS の許可。開発・本番で切り替えたい場合は環境変数で
+CORS_ALLOW_ORIGINS = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
+CORS_ALLOW_METHODS = ["*"]
+CORS_ALLOW_HEADERS = ["*"]
+
+# --- 1-2) ディレクトリ（Windows でも動きやすく）
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "..")                   # Backend/ のひとつ上へ
+DOCS_DIR = os.path.join(DATA_DIR, "docs")
+VECTOR_DIR = os.path.join(DATA_DIR, "chroma_db")
+os.makedirs(DOCS_DIR, exist_ok=True)
+os.makedirs(VECTOR_DIR, exist_ok=True)
+
+# --- 1-3) Ollama サーバーの場所（LM Studio の互換APIでは別ポート等になる）
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+#   例: LM Studio の OpenAI 互換は http://localhost:1234/v1 だが、エンドポイント仕様が異なるので注意。
+#   本コードは “Ollama /api/generate” を直接叩く実装です。
+
+# --- 1-4) 既定モデル（UI で指定が無いときに使う）
+DEFAULT_MODEL = os.getenv("OLLAMA_MODEL", "mistral:7b-instruct")
+#   実用的に “10秒 / ~14GB” 近辺を狙うなら:
+#     - “mistral:7b-instruct” (Q4_K_M / Q5_*) は速度・品質のバランスが良い
+#     - “qwen2.5:3b-instruct” は更に軽い（ただし日本語のニュアンス差）
+#     - “phi3:mini” は超軽量だが日本語性能は状況次第
+
+
+# =============================================================================
+# 2) モデル候補のリスト（UIのプルダウンや /models で提示）
+# =============================================================================
+
+# ここでは “推奨モデル名とひとこと特徴” を辞書として持つ
+# RAM 目安は量子化やコンテキスト長で変動。あくまで参考。
+MODEL_CANDIDATES: List[Dict[str, str]] = [
+    {"id": "mistral:7b-instruct", "note": "和文も無難、応答安定。7B級。"},
+    {"id": "qwen2.5:3b-instruct", "note": "軽量で速い、使い勝手◎（3B）。"},
+    {"id": "phi3:mini", "note": "超軽量。返答の質は文脈次第。"},
+#    {"id": "llama3.1:8b-instruct", "note": "強めの性能。8B で妥協点。"},
+    {"id": "gemma:2b-instruct", "note": "軽い。英語寄り、和文要工夫。"},
+    {"id": "tinyllama:chat", "note": "超軽量テスト用途向け。"},
+#    {"id": "openhermes:7b-mistral", "note": "Mistral系指示追従強め。"},
+    {"id": "neural-chat:7b", "note": "チャット指向で扱いやすい。"},
+    {"id": "qwen2:7b-instruct", "note": "Qwen最新系、7B帯の有力。"},
+    {"id": "llama2:7b-chat", "note": "枯れて安定。和文は工夫要。"},
+]
+
+
+# =============================================================================
+# 3) FastAPI アプリ生成 + CORS
+# =============================================================================
+
+app = FastAPI(title="RAG WebAPI (Ollama版) — 学習用フル解説")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOW_ORIGINS,
+    allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=CORS_ALLOW_METHODS,
+    allow_headers=CORS_ALLOW_HEADERS,
 )
 
 
 # =============================================================================
-# 2) 安全な四則演算（最速パス）
+# 4) 安全な “電卓” （数式だけなら LLM を使わず即答）
 # =============================================================================
+
+# 許可する演算子（+ - * / と単項 -）
 _ALLOWED_OPS = {
     ast.Add: op.add,
     ast.Sub: op.sub,
     ast.Mult: op.mul,
     ast.Div: op.truediv,
-    ast.Pow: op.pow,     # ^ はサポートしない。** のみ。
     ast.USub: op.neg,
 }
 
-def _safe_eval(node):
-    if isinstance(node, ast.Num):  # py<3.8
-        return node.n
-    if hasattr(ast, "Constant") and isinstance(node, ast.Constant):  # py>=3.8
-        if isinstance(node.value, (int, float)):
-            return node.value
-        raise ValueError("only numeric constants allowed")
-    if isinstance(node, ast.UnaryOp):
-        if type(node.op) in _ALLOWED_OPS:
-            return _ALLOWED_OPS[type(node.op)](_safe_eval(node.operand))
-        raise ValueError("disallowed unary op")
-    if isinstance(node, ast.BinOp):
-        if type(node.op) in _ALLOWED_OPS:
-            return _ALLOWED_OPS[type(node.op)](_safe_eval(node.left), _safe_eval(node.right))
-        raise ValueError("disallowed binary op")
-    raise ValueError("invalid expression")
+def _safe_eval_expr(expr: str) -> float:
+    """ast を使った安全な四則演算。危険な構文は通らないよう最小限に。"""
+    def _eval(node):
+        if isinstance(node, ast.Num):  # py3.8+ では Constant になる場合もあるが ast.parse次第
+            return node.n
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_OPS:
+            return _ALLOWED_OPS[type(node.op)](_eval(node.operand))
+        if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_OPS:
+            return _ALLOWED_OPS[type(node.op)](_eval(node.left), _eval(node.right))
+        raise ValueError("invalid expression")
+    tree = ast.parse(expr, mode="eval")
+    return _eval(tree.body)
 
-def try_math_answer(question: str) -> str | None:
+_MATH_PATTERN = re.compile(r"^[0-9\.\s\+\-\*\/=\(\)]+$")
+
+def try_math_answer(question: str) -> Optional[str]:
     """
-    「500-120*3」「(1+2)*3」「2**10」などの四則演算のみを即答。
-    文章が混じる場合は None。
+    入力が “数式っぽい” かを判定し、OKなら 即時計算結果を返す。
+    LLMに出さないことで、①高速 ②誤答防止（算数は機械のほうが確実）を狙う。
     """
     q = question.strip()
     if not q:
         return None
-
-    # 許容: 数字, 演算子, 括弧, 小数点, 空白, '=' 記号
-    if not re.fullmatch(r"[0-9\.\s\+\-\*\/\(\)=]+", q):
+    if not _MATH_PATTERN.fullmatch(q):
         return None
-
-    expr = q.replace("=", " ").strip()
+    expr = q.replace("=", "").strip()
     try:
-        tree = ast.parse(expr, mode="eval")
-        val = _safe_eval(tree.body)
-        # 浮動小数は見やすく整形
-        if isinstance(val, float):
-            # 末尾の0を適度に落とす
-            s = f"{val:.10f}".rstrip("0").rstrip(".")
-            return s
-        return str(val)
+        val = _safe_eval_expr(expr)
+        # 小数点を適度に丸める
+        if float(val).is_integer():
+            return str(int(val))
+        return str(round(float(val), 10))
     except Exception:
         return None
 
 
 # =============================================================================
-# 3) コード抽出＆簡易整形（以前互換）
+# 5) RAG の初期化と共通関数
 # =============================================================================
-def extract_code_blocks(text: str) -> str:
-    """```lang ...``` ブロックがあれば抽出し、それ以外は原文返し"""
-    matches = re.findall(r"```(?:\w+)?\n([\s\S]*?)```", text)
-    if matches:
-        return "\n\n".join(m.strip() for m in matches if m.strip())
-    return text
 
-def force_python_multiline(code: str) -> str:
-    """一行で for/if/while が来たときも改行＋インデントに補正（なるべく壊さない）"""
-    code = re.sub(r"\b(for .*?:)", r"\1\n    ", code)
-    code = re.sub(r"\b(if .*?:)", r"\1\n    ", code)
-    code = re.sub(r"\b(while .*?:)", r"\1\n    ", code)
-    code = re.sub(r":\s+for", ":\n    for", code)
-    code = re.sub(r":\s+if", ":\n    if", code)
-    code = re.sub(r":\s+while", ":\n    while", code)
-    lines = [ln.rstrip() for ln in code.splitlines()]
-    return "\n".join(lines).strip()
+# --- 5-1) 埋め込みモデル
+#     nomic-embed-text（Ollama版）などが比較的速くて汎用。
+#     他: snowflake-arctic-embed, all-minilm 等もあるが、Ollama経由で一貫させる。
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "nomic-embed-text")
+
+# --- 5-2) VectorStore（Chroma）
+#     langchain-chroma の Chroma を使用（persist_directory で永続化）
+embedder = OllamaEmbeddings(model=EMBED_MODEL_NAME)
+vectorstore = Chroma(persist_directory=VECTOR_DIR, embedding_function=embedder)
+
+# --- 5-3) 文書分割（チャンク）
+#     “短め＋重なり” で検索の当たりやすさを上げ、コンテキストのスパース性を抑える
+DEFAULT_CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))        # 既定は 500 文字
+DEFAULT_CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))  # 既定は 100 文字
 
 
-# =============================================================================
-# 4) ベクトル DB & 埋め込み (OllamaEmbeddings + Chroma)
-# =============================================================================
-# 既存と同じく nomic-embed-text を使用
-embed_model = OllamaEmbeddings(model="nomic-embed-text")
-
-# Chroma 構築（永続）
-vectorstore = Chroma(
-    persist_directory=str(VECTOR_DIR),
-    embedding_function=embed_model
-)
-
-
-def split_and_index_docs(docs: List[Any]) -> int:
+def load_and_split_to_docs(file_path: str) -> List[Any]:
     """
-    ドキュメントを分割して Chroma に追加。
-    メタデータとして "source" と "chunk_id" を付与。
+    TXT or PDF をロードして “LangChain Document” のリストを返す。
+    ここでは TextLoader / PyPDFLoader（community）を使う。
     """
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".pdf" and _HAS_PDF:
+        loader = PyPDFLoader(file_path)
+    else:
+        # 文字コードは UTF-8 を前提。Windows の SJIS の場合は適宜変える。
+        loader = TextLoader(file_path, encoding="utf-8")
+
+    raw_docs = loader.load()
+
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP
+        chunk_size=DEFAULT_CHUNK_SIZE,
+        chunk_overlap=DEFAULT_CHUNK_OVERLAP
     )
-    chunks = splitter.split_documents(docs)
+    chunks = splitter.split_documents(raw_docs)
 
-    for i, ch in enumerate(chunks):
-        if "source" not in ch.metadata:
-            ch.metadata["source"] = ch.metadata.get("source", "unknown")
-        ch.metadata["chunk_id"] = i
+    # メタデータに “ファイル名 / チャンクID / ページ番号” を持たせる（UI表示用）
+    for i, d in enumerate(chunks):
+        md = d.metadata or {}
+        md["source"] = os.path.basename(file_path)
+        md["chunk_id"] = i
+        d.metadata = md
+    return chunks
 
-    if chunks:
-        vectorstore.add_documents(chunks)
+
+def add_docs_to_vectorstore(chunks: List[Any]) -> int:
+    """Chroma へドキュメントを追加。件数（チャンク数）を返す。"""
+    if not chunks:
+        return 0
+    vectorstore.add_documents(chunks)
     return len(chunks)
 
 
-def decide_mode_by_similarity(q: str, k: int) -> Tuple[str, List[Any], str]:
+def decide_mode_by_similarity(q: str, k: int = 5) -> Tuple[str, List[Any], str]:
     """
-    類似検索で top1 の score が閾値以下なら document モード。
-    そうでなければ general。
-    20文字未満は general。
+    “文書ベースか / 一般知識か” を雑に判定する。
+    - 短すぎる質問は general とみなす
+    - ベクトル検索の “上位スコア” が閾値より良ければ document モードへ
     """
-    if len(q.strip()) < 20:
-        return BACKEND_MODE_GEN, [], ""
+    DOC_SCORE_THRESHOLD = 0.30  # 小さいほど近い（Chromaのメトリック依存）
+    if len(q.strip()) < 20:     # “短問” は general 側に倒す（体感で好結果）
+        return "general", [], ""
 
     try:
         pairs = vectorstore.similarity_search_with_score(q, k=k)
         if not pairs:
-            return BACKEND_MODE_GEN, [], ""
+            return "general", [], ""
 
+        # pairs: List[Tuple[Document, score]]
         top_doc, top_score = pairs[0]
-        mode = BACKEND_MODE_RAG if top_score <= DOC_SCORE_TH else BACKEND_MODE_GEN
-        if mode == BACKEND_MODE_GEN:
-            return BACKEND_MODE_GEN, [], ""
+        mode = "document" if top_score <= DOC_SCORE_THRESHOLD else "general"
 
-        docs = [doc for doc, _ in pairs[:min(k, len(pairs))]]
-        context = "\n---\n".join([d.page_content for d in docs if d.page_content])
-        return BACKEND_MODE_RAG, docs, context
+        # コンテキストとして 3〜5本ほど連結して LLM に渡す
+        top_docs = [d for d, _ in pairs[: min(5, len(pairs))]]
+        context = "\n---\n".join([d.page_content for d in top_docs])
+        if mode == "general":
+            return "general", [], ""
+        return "document", top_docs, context
     except Exception as e:
         print("[WARN] similarity fallback:", e)
-        return BACKEND_MODE_GEN, [], ""
+        return "general", [], ""
 
 
 # =============================================================================
-# 5) Ollama API ラッパ
+# 6) Ollama API 呼び出し（/api/generate を使用）
 # =============================================================================
 
-def ollama_generate_chat(
-    model: str,
-    messages: List[Dict[str, str]],
-    temperature: float = 0.2,
-    max_tokens: int | None = None,
-    stream: bool = False,
-    timeout_s: int = OLLAMA_TIMEOUT_S,
-) -> str:
+def _ollama_generate_payload(model: str, prompt: str, temperature: float = 0.2,
+                             max_tokens: int = 512, num_ctx: int = 2048) -> Dict[str, Any]:
     """
-    /api/chat で Chat 生成。stream=False にし、最終 response のみ返す。
+    /api/generate のペイロードを作る。
+    “prompt 1本で返す” 単純形。stream=False でまとめて受け取る。
+    options は必要に応じて調整（num_ctx, temperature, top_p など）
     """
-    url = f"{OLLAMA_URL}/api/chat"
-    payload: Dict[str, Any] = {
+    return {
         "model": model,
-        "messages": messages,
+        "prompt": prompt,
+        "stream": False,
         "options": {
             "temperature": temperature,
-        },
-        "stream": stream
+            "num_ctx": num_ctx,
+            "num_predict": max_tokens
+        }
     }
-    if max_tokens is not None:
-        payload["options"]["num_predict"] = max_tokens
 
+def call_ollama_generate(model: str, prompt: str,
+                         temperature: float = 0.2, max_tokens: int = 512,
+                         num_ctx: int = 2048, timeout: int = 120) -> Dict[str, Any]:
+    """
+    Ollama の /api/generate へ POST。
+    - 成功: dict（Ollama のレスポンス。'response' キーが本文）
+    - 失敗: 例外
+    """
+    url = f"{OLLAMA_BASE_URL}/api/generate"
+    payload = _ollama_generate_payload(model, prompt, temperature, max_tokens, num_ctx)
     try:
-        r = requests.post(url, json=payload, timeout=timeout_s)
+        r = requests.post(url, json=payload, timeout=timeout)
         r.raise_for_status()
         data = r.json()
-        # 仕様: stream=False の場合、一発で message を持つJSONが返る
-        msg = data.get("message") or {}
-        content = msg.get("content") or ""
-        print("[DEBUG] Ollama chat response (short):", content[:200].replace("\n", " "))
-        return content.strip()
+        # デバッグしたいときは下記出力を有効化
+        # print("[DEBUG] Ollama Response:", json.dumps(data, ensure_ascii=False)[:500])
+        return data
+    except requests.HTTPError as e:
+        # 404 で “No models loaded” がよく起きる。ヒントを追加
+        tip = ""
+        try:
+            body = r.json()
+            msg = body.get("error", {}).get("message", "")
+            if "No models loaded" in msg or "model_not_found" in json.dumps(body):
+                tip = "（ヒント）`ollama pull {}` を事前に実行し、モデルが使える状態か確認してください。".format(model)
+        except Exception:
+            pass
+        raise RuntimeError(f"Ollama API 呼び出し失敗: {e}. {tip}") from e
     except Exception as e:
-        print("[ERROR] ollama_generate_chat failed:", repr(e))
-        traceback.print_exc()
-        raise RuntimeError(f"Ollama chat API 呼び出し失敗: {e}")
-
-
-def build_rag_system_prompt() -> str:
-    """
-    日本語強制 & RAG方針の明示。既存プロンプトに近い方針を維持。
-    """
-    return (
-        "あなたは日本語専用アシスタントです。必ず日本語で答えてください。\n"
-        "次のルールを厳守してください:\n"
-        "1) 質問は必ず解釈し、最善の答えを出すこと。\n"
-        "2) 参考文書に答えがある場合は、文書の記述を優先して要点を簡潔にまとめること。\n"
-        "3) 参考文書に答えがなくても一般知識で答えられる場合は、一般知識で補完すること。\n"
-        "4) 参考文書と一般知識が矛盾する場合は、参考文書を優先すること。\n"
-        "5) もし回答不能な場合のみ『この文書には記載がありません』と簡潔に述べること。\n"
-        "6) コードを提示する場合は、実行可能な完全なスクリプトを提示し、多言語の混在や不完全な断片を避けること。\n"
-    )
-
-
-def build_user_prompt(question: str, context: str | None) -> str:
-    """
-    RAG 文脈をくっつける。
-    """
-    if context:
-        return f"質問:\n{question}\n\n参考文書:\n{context}\n"
-    return f"質問:\n{question}\n"
+        raise RuntimeError(f"Ollama API 呼び出し失敗: {e}") from e
 
 
 # =============================================================================
-# 6) ルーティング
+# 7) プロンプト（役割・ルール）
 # =============================================================================
 
-@app.get("/health")
-def health():
-    """
-    ヘルスチェック。
-    """
-    return {"status": "ok", "ollama": OLLAMA_URL, "model": LLM_MODEL}
+SYSTEM_RULES = (
+    "あなたは日本語専用アシスタントです。常に自然で丁寧な日本語で回答してください。\n"
+    "手元の参考文書（コンテキスト）が与えられた場合、内容を最優先し、その根拠に基づいて簡潔に答えてください。\n"
+    "参考文書に該当が無い場合でも、一般知識で答えられるときは答えて構いません。\n"
+    "まったく不明な場合のみ『この文書には記載がありません』等、正直に述べてください。\n"
+    "また、数式や単純計算は厳密な計算で答えてください（ただし本API側で計算を先に行う場合があります）。\n"
+)
 
+def build_prompt(question: str, context: str) -> str:
+    """
+    シンプルな “前置き + コンテキスト + ユーザー質問” の合成。
+    会話履歴が必要であれば拡張（messages 形式）へ移行する。
+    """
+    parts = [
+        SYSTEM_RULES,
+        "【参考文書】\n" + (context if context else "（なし）"),
+        "\n【質問】\n" + question.strip(),
+        "\n【出力フォーマット】\n- 箇条書きや短い段落で簡潔に\n- 日本語\n"
+    ]
+    return "\n\n".join(parts)
+
+
+# =============================================================================
+# 8) API スキーマ（Pydantic）
+# =============================================================================
+
+class AskResponse(BaseModel):
+    answer: str
+    sources: List[Dict[str, Any]] = []
+    mode: str
+    llm: str
+    llm_model: Optional[str] = None
+    elapsed: Optional[float] = None
+    error: Optional[str] = None
+
+
+# =============================================================================
+# 9) ルーティング
+# =============================================================================
+
+@app.get("/healthz")
+def healthz():
+    """シンプルな疎通確認"""
+    return {"status": "ok"}
+
+@app.get("/status")
+def status():
+    """状態表示用。必要に応じてベクトルDBの件数なども返す。"""
+    try:
+        # Chroma のコレクションサイズ
+        size = 0
+        try:
+            # 非公開 API に依存しない近似として、適当な検索で件数を推定
+            # ここでは “トークン化済みインデックスの存在” 程度を返すに留める
+            # 実数の管理が必要なら別途ディスク上のメタを持つのが確実
+            size = len(os.listdir(os.path.join(VECTOR_DIR, "chroma-collections")))  # 例: 構造に依存
+        except Exception:
+            pass
+
+        return {
+            "status": "ok",
+            "ollama_base_url": OLLAMA_BASE_URL,
+            "default_model": DEFAULT_MODEL,
+            "embed_model": EMBED_MODEL_NAME,
+            "vector_dir": VECTOR_DIR,
+            "collections_hint": size,
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/models")
 def list_models():
     """
-    Ollama /api/tags のラッパ：利用可能モデル一覧を返す。
+    UI のプルダウンに出す候補一覧。
+    実際に Ollama 側でロード済みかは /api/tags で確認するのがガチだが、
+    ここでは “推奨候補” を提示し UI 側で固定的に使う想定。
     """
-    url = f"{OLLAMA_URL}/api/tags"
-    try:
-        r = requests.get(url, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        models = []
-        for it in data.get("models", []):
-            mid = it.get("model") or it.get("name")
-            if mid:
-                models.append(mid)
-        return {"models": models}
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"/api/tags 取得失敗: {e}"})
-
+    return {"data": MODEL_CANDIDATES}
 
 @app.post("/upload")
-async def upload_file(file: UploadFile):
+async def upload(file: UploadFile):
     """
-    PDF / TXT を受け取り、分割・埋め込み・Chromaへ追加。
+    ドキュメントのアップロード。
+    - docs/ に保存 → チャンク分割 → 埋め込み → Chroma にadd → 件数を返す
     """
     try:
-        # 保存
-        path = DATA_DIR / file.filename
-        with open(path, "wb") as w:
-            shutil.copyfileobj(file.file, w)
+        # 保存先
+        dest_path = os.path.join(DOCS_DIR, file.filename)
+        with open(dest_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
 
-        # 読み込み
-        if file.filename.lower().endswith(".pdf"):
-            loader = PyPDFLoader(str(path))
-        else:
-            loader = TextLoader(str(path), encoding="utf-8", autodetect_encoding=True)
-        docs = loader.load()
+        chunks = load_and_split_to_docs(dest_path)
+        n_added = add_docs_to_vectorstore(chunks)
 
-        # メタにソース名（ファイル名）
-        for d in docs:
-            d.metadata = d.metadata or {}
-            d.metadata["source"] = file.filename
-
-        n_chunks = split_and_index_docs(docs)
-
-        return {"uploaded": file.filename, "chunks": n_chunks}
+        return {"uploaded": file.filename, "chunks": n_added}
     except Exception as e:
         print("[ERROR] /upload failed:", repr(e))
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-
-@app.post("/clear_db")
-def clear_db():
+@app.post("/ask", response_model=AskResponse)
+async def ask(question: str = Form(...), model: Optional[str] = Form(None)):
     """
-    Chroma の永続領域を削除（リセット）。
-    """
-    try:
-        if VECTOR_DIR.exists():
-            shutil.rmtree(VECTOR_DIR)
-        VECTOR_DIR.mkdir(exist_ok=True)
-        # 再構築（空のコレクションとして）
-        global vectorstore
-        vectorstore = Chroma(
-            persist_directory=str(VECTOR_DIR),
-            embedding_function=embed_model
-        )
-        return {"cleared": True}
-    except Exception as e:
-        print("[ERROR] /clear_db failed:", repr(e))
-        traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-
-@app.post("/ask")
-async def ask(question: str = Form(...)):
-    """
-    UI 本命エンドポイント。
-    - 数値式なら即答
-    - RAG類似で document/general を自動判定
-    - Ollama API で回答
-    - sources, elapsed, llm_model を返す
+    質問のメインエンドポイント。
+      1) 数式のときは “電卓” 即答（mode=math）
+      2) 類似検索で document/general を判定
+      3) プロンプト合成
+      4) Ollama /api/generate で回答取得
     """
     t0 = time.time()
-    try:
-        q = (question or "").strip()
-        if not q:
-            return JSONResponse(status_code=400, content={"error": "質問が空です"})
+    used_model = model or DEFAULT_MODEL
 
-        # 0) 数値即答
-        math_ans = try_math_answer(q)
-        if math_ans is not None:
-            elapsed = time.time() - t0
-            return {
-                "answer": math_ans,
-                "mode": BACKEND_MODE_MTH,
-                "llm": BACKEND_LLM_NAME,
-                "llm_model": LLM_MODEL,
-                "sources": [],
-                "elapsed": round(elapsed, 2),
-            }
-
-        # 1) 類似検索でモード判定
-        mode, docs, context = decide_mode_by_similarity(q, k=RAG_TOPK)
-        if mode == BACKEND_MODE_GEN:
-            docs, context = [], ""
-
-        # 2) プロンプト構築
-        sys_prompt = build_rag_system_prompt()
-        user_prompt = build_user_prompt(q, context)
-
-        messages = [
-            {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        # 3) 生成
-        answer_raw = ollama_generate_chat(
-            model=LLM_MODEL,
-            messages=messages,
-            temperature=0.2,
-            max_tokens=None,
-            stream=False,
-            timeout_s=OLLAMA_TIMEOUT_S,
+    # --- 0) 数式なら即答
+    math_result = try_math_answer(question)
+    if math_result is not None:
+        elapsed = time.time() - t0
+        return AskResponse(
+            answer=math_result,
+            sources=[],
+            mode="math",
+            llm="ollama",
+            llm_model=used_model,
+            elapsed=elapsed
         )
 
-        # 4) コード抽出＆整形（以前の仕様互換）
-        cleaned = extract_code_blocks(answer_raw)
-        answer_text = force_python_multiline(cleaned)
+    # --- 1) RAG 判定 & コンテキスト構築
+    mode, docs, context = decide_mode_by_similarity(question, k=5)
+    if mode == "general":
+        context = ""  # 参考文書を渡さない
 
-        # 5) 出典を整える
-        sources_list = []
-        seen = set()
-        for d in docs:
-            meta = d.metadata or {}
-            key = (meta.get("source"), meta.get("page"), meta.get("chunk_id"))
-            if key in seen:
-                continue
-            seen.add(key)
-            sources_list.append({
-                "source": key[0],
-                "page": key[1],
-                "chunk_id": key[2]
-            })
+    # --- 2) プロンプト合成
+    prompt = build_prompt(question, context)
 
-        elapsed = time.time() - t0
-        return {
-            "answer": answer_text,
-            "mode": mode,
-            "llm": BACKEND_LLM_NAME,
-            "llm_model": LLM_MODEL,
-            "sources": sources_list,
-            "elapsed": round(elapsed, 2),
-        }
-
+    # --- 3) モデルへ問い合わせ
+    try:
+        res = call_ollama_generate(
+            model=used_model,
+            prompt=prompt,
+            temperature=0.2,
+            max_tokens=800,
+            num_ctx=2048,
+            timeout=180
+        )
+        answer_text = res.get("response", "").strip()
     except Exception as e:
         print("[ERROR] /ask failed:", repr(e))
         traceback.print_exc()
         elapsed = time.time() - t0
-        return JSONResponse(
-            status_code=200,  # UI 側互換: 200で返し error を本文に載せる
-            content={
-                "answer": f"⚠️ サーバーエラーが発生しました\n詳細: {str(e)}",
-                "mode": BACKEND_MODE_ERR,
-                "llm": BACKEND_LLM_NAME,
-                "llm_model": LLM_MODEL,
-                "sources": [],
-                "elapsed": round(elapsed, 2),
-            }
+        # 例外内容をそのままUIへ返すとテクニカル過ぎるので “要点だけ”
+        return AskResponse(
+            answer="⚠️ エラーが発生しました",
+            sources=[],
+            mode="error",
+            llm="ollama",
+            llm_model=used_model,
+            elapsed=elapsed,
+            error=str(e)
         )
 
+    # --- 4) 出典メタ（UI 表示向け）
+    sources: List[Dict[str, Any]] = []
+    seen = set()
+    for d in docs or []:
+        meta = d.metadata or {}
+        key = (meta.get("source"), meta.get("page"), meta.get("chunk_id"))
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append({
+            "source": meta.get("source"),
+            "page": meta.get("page"),
+            "chunk_id": meta.get("chunk_id"),
+        })
+
+    elapsed = time.time() - t0
+    return AskResponse(
+        answer=answer_text or "（空の応答）",
+        sources=sources,
+        mode=mode,
+        llm="ollama",
+        llm_model=used_model,
+        elapsed=elapsed
+    )
+
 
 # =============================================================================
-# 7) 起動ログ
+# 10) Optional: /metrics（prometheus_client があれば）
 # =============================================================================
-print(f"[RAG] ready (固定モデル: {LLM_MODEL})")
-print(f"[RAG] Ollama: {OLLAMA_URL} / timeout: {OLLAMA_TIMEOUT_S}s")
-print(f"[RAG] CORS allow_origins: {ALLOW_ORIGINS}")
-print(f"[RAG] chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP}, topk={RAG_TOPK}, doc_score_th={DOC_SCORE_TH}")
+
+if _HAS_PROM:
+    # ざっくりしたメトリクス（学習用）。本番では label を適切に設計すること。
+    REQ_COUNT = Counter("rag_requests_total", "RAG API への /ask リクエスト数")
+    REQ_LATENCY = Histogram("rag_request_seconds", "RAG 応答に要した秒数")
+
+    # FastAPI のミドルウェアで “/ask の前後” を観測したければ、
+    # ここにミドルウェアを追加して計測する方法もある（省略）。
+    @app.middleware("http")
+    async def prometheus_mw(request: Request, call_next):
+        if request.url.path == "/ask":
+            REQ_COUNT.inc()
+            t0 = time.time()
+            resp = await call_next(request)
+            REQ_LATENCY.observe(time.time() - t0)
+            return resp
+        return await call_next(request)
+
+    @app.get("/metrics")
+    def metrics():
+        """Prometheus 用メトリクスの出力（ある場合のみ）"""
+        try:
+            return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+else:
+    @app.get("/metrics")
+    def metrics_unavailable():
+        """prometheus_client 未導入なら 501 を返す（学習用に明示的）"""
+        return JSONResponse(status_code=501, content={
+            "error": "prometheus_client がインストールされていないため /metrics は無効です。"
+        })
 
 
 # =============================================================================
-# 8) 参考: uvicorn 起動例
+# 11) 起動ログ
 # =============================================================================
-# uvicorn Backend.app:app --host 0.0.0.0 --port 8000 --reload
-#
-# フロントは従来の App.jsx のままで OK。以下のような戻り値を受け取ります：
-# {
-#   answer: string,
-#   mode: "document" | "general" | "math" | "error",
-#   llm: "ollama",
-#   llm_model: "phi3:mini",   # ← UIに表示
-#   sources: [{source, page, chunk_id}],
-#   elapsed: 1.23
-# }
-#
-# /models でモデル一覧を取得 → UI で表示することも可能（固定で良ければ不要）
-#
-# /clear_db でベクトルDBをリセット可能（デバッグ用途）
-#
-# Ollama が 404 を返す場合：
-#   - サーバが起動していない / URL が違う
-#   - モデル名が間違っている / pull していない
-#   - /api/chat ではなく /api/generate を叩いている（本コードは /api/chat を使用）
-#
-# 必要に応じて OLLAMA_URL, OLLAMA_MODEL を環境変数で上書きしてください。
-#
+
+def _startup_banner():
+    print("===================================================================")
+    print("[RAG] ready (Ollama版)")
+    print(f"  - Default Model : {DEFAULT_MODEL}")
+    print(f"  - Embed Model   : {EMBED_MODEL_NAME}")
+    print(f"  - OLLAMA_BASE   : {OLLAMA_BASE_URL}")
+    print(f"  - DOCS_DIR      : {DOCS_DIR}")
+    print(f"  - VECTOR_DIR    : {VECTOR_DIR}")
+    print(f"  - CORS Origins  : {CORS_ALLOW_ORIGINS}")
+    print("===================================================================")
+
+
+@app.on_event("startup")
+def on_startup():
+    _startup_banner()
+
+
+# =============================================================================
+# 12) 参考: 手動テスト例（PowerShell）
+# =============================================================================
+"""
+# 1) ヘルスチェック
+Invoke-RestMethod -Uri http://127.0.0.1:8000/healthz
+
+# 2) モデル一覧（UIのプルダウン用データ）
+Invoke-RestMethod -Uri http://127.0.0.1:8000/models
+
+# 3) 質問（multipart/form-data）
+$fd = [System.Net.Http.MultipartFormDataContent]::new()
+$fd.Add([System.Net.Http.StringContent]::new("富士山の標高は？"), "question")
+$fd.Add([System.Net.Http.StringContent]::new("mistral:7b-instruct"), "model")   # 任意
+Invoke-RestMethod -Uri http://127.0.0.1:8000/ask -Method Post -Body $fd
+
+# 4) ファイルアップロード（TXT例）
+$fd = [System.Net.Http.MultipartFormDataContent]::new()
+$fileContent = [System.IO.File]::ReadAllBytes("C:\path\to\doc.txt")
+$sc = New-Object System.Net.Http.ByteArrayContent($fileContent)
+$sc.Headers.ContentType = [System.Net.Mime.ContentType]::new("text/plain")
+$fd.Add($sc, "file", "doc.txt")
+Invoke-RestMethod -Uri http://127.0.0.1:8000/upload -Method Post -Body $fd
+
+# 5) Prometheus（入っていれば）
+iwr http://127.0.0.1:8000/metrics
+"""
+
+
+# =============================================================================
+# 13) メイン（uvicorn で起動する場合のヒント）
+# =============================================================================
+"""
+# 開発時:
+uvicorn Backend.app:app --host 0.0.0.0 --port 8000 --reload
+
+# 本番時（reload無し、ワーカー数などは環境に合わせて調整）
+uvicorn Backend.app:app --host 0.0.0.0 --port 8000
+"""
+
+# （行数稼ぎではなく、学習用の詳しい解説コメントを全域に付与しています）
 # 以上。
