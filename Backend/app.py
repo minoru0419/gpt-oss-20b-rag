@@ -2,23 +2,11 @@
 # ======================================================================
 # RAG WebUI バックエンド (FastAPI)
 # - Ollama API を利用した LLM 応答生成
-# - RAG (Retrieval-Augmented Generation) 簡易実装
-# - ファイルアップロード → 即RAG反映
+# - RAG (Retrieval-Augmented Generation) 簡易実装（★永続化対応）
+# - ファイルアップロード → 即RAG反映（DB保存）
 # - コード生成専用エンドポイント (/code)
-# ======================================================================
-#
-# 2025-09 現在の仕様
-# - /ask    → 通常の質問応答（RAG・一般QA）
-# - /code   → コード生成専用（Python等）
-# - /upload → ファイルアップロード（PDF, TXTなど）
-# - /models → 利用可能モデル一覧
-# - Ollama の /api/generate を使用
-#
-# 将来拡張予定
-# - 本格的なベクタDB検索（Chroma, Weaviate 等）
-# - 音声入出力
-# - セッション管理
-# - エラーログ収集
+# - 再起動後もDBからRAG文脈を取得
+# - 既存 ./uploaded_files への保存は継続
 # ======================================================================
 
 from fastapi import FastAPI, Form, UploadFile, File
@@ -30,6 +18,8 @@ import time
 import shutil
 import ast
 import json
+import sqlite3
+from typing import List, Tuple
 
 # PDF読み込み用
 try:
@@ -40,12 +30,12 @@ except ImportError:
 # ------------------------------------------------------
 # アプリ初期化
 # ------------------------------------------------------
-app = FastAPI(title="RAG WebUI Backend", version="1.2")
+app = FastAPI(title="RAG WebUI Backend", version="1.3-persist")
 
 # フロントエンド(CORS許可: ローカル開発用)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本番環境では適切に制限する
+    allow_origins=["*"],  # 本番は適切に制限
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -56,33 +46,85 @@ app.add_middleware(
 # ------------------------------------------------------
 OLLAMA_API = "http://localhost:11434/api/generate"
 UPLOAD_DIR = "./uploaded_files"
+DB_DIR = "./rag_store"
+DB_PATH = os.path.join(DB_DIR, "rag_store.sqlite3")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(DB_DIR, exist_ok=True)
+
+# 1ドキュメントからプロンプトに入れる最大文字数（安全枠）
+MAX_SNIPPET_CHARS = 2000
+# /ask で結合する最大件数
+MAX_CONTEXT_DOCS = 3
 
 # ------------------------------------------------------
-# グローバルRAGコンテキスト
+# SQLite 永続化レイヤ
 # ------------------------------------------------------
-RAG_CONTEXTS = []
+def _connect():
+    # 毎回短命接続（スレッド安全・自動クローズ）
+    return sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+
+def init_storage():
+    with _connect() as conn:
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT NOT NULL,
+            path TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at REAL NOT NULL
+        );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_docs_created ON docs(created_at DESC);")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_docs_path ON docs(path);")
+
+def save_document(filename: str, path: str, content: str):
+    # 既存ファイルはUPSERT（pathをユニークキー扱い）
+    now = time.time()
+    with _connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO docs(filename, path, content, created_at) VALUES(?,?,?,?)",
+                (filename, path, content, now),
+            )
+        except sqlite3.IntegrityError:
+            # 既に登録済み → 更新として扱う
+            conn.execute(
+                "UPDATE docs SET filename=?, content=?, created_at=? WHERE path=?",
+                (filename, content, now, path),
+            )
+
+def get_recent_docs(limit: int = MAX_CONTEXT_DOCS) -> List[Tuple[str, str]]:
+    # [(filename, content), ...] を新しい順で返す
+    with _connect() as conn:
+        cur = conn.execute(
+            "SELECT filename, content FROM docs ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        return cur.fetchall()
+
+def count_docs() -> int:
+    with _connect() as conn:
+        cur = conn.execute("SELECT COUNT(*) FROM docs")
+        return int(cur.fetchone()[0])
+
+# 起動時にDB初期化
+init_storage()
 
 # ------------------------------------------------------
 # Ollama API 呼び出しヘルパー
 # ------------------------------------------------------
 def call_ollama_generate(model: str, prompt: str, stream: bool = False):
-    """
-    Ollama の /api/generate を呼び出して応答を取得する。
-    stream=False の場合でも、jsonlで返ることがあるので処理を工夫する。
-    """
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": stream,
         "options": {
-            "temperature": 0.0  # 安定化
+            "temperature": 0.0
         }
     }
     try:
         r = requests.post(OLLAMA_API, json=payload, timeout=600)
         r.raise_for_status()
-        # JSONL 形式も処理
         try:
             return r.json()
         except Exception:
@@ -100,25 +142,25 @@ def call_ollama_generate(model: str, prompt: str, stream: bool = False):
         raise RuntimeError(f"Ollama API 呼び出し失敗: {e}. {tip}") from e
 
 # ------------------------------------------------------
-# RAG検索 (シンプル版)
+# RAG検索（DB永続化版）
 # ------------------------------------------------------
-def retrieve_context(question: str):
+def retrieve_context(question: str) -> str:
     """
-    アップロード済みファイル内容を返す。
-    実際にはベクタDB検索を行うが、ここでは最新3件を結合。
+    最新ドキュメントから最大MAX_CONTEXT_DOCS件を連結。
     """
-    if not RAG_CONTEXTS:
+    docs = get_recent_docs(limit=MAX_CONTEXT_DOCS)
+    if not docs:
         return f"関連情報なし: {question}"
-    return "\n".join(RAG_CONTEXTS[-3:])
+    chunks = []
+    for filename, content in docs:
+        snippet = (content or "")[:MAX_SNIPPET_CHARS]
+        chunks.append(f"【{filename}】\n{snippet}")
+    return "\n\n".join(chunks)
 
 # ------------------------------------------------------
 # コード検証ユーティリティ
 # ------------------------------------------------------
 def validate_python_code(code: str) -> bool:
-    """
-    生成コードがPythonとして構文的に正しいか検証する。
-    True = OK / False = NG
-    """
     try:
         ast.parse(code)
         return True
@@ -134,11 +176,6 @@ async def ask(
     question: str = Form(...),
     model: str = Form("llama3.1:8b"),
 ):
-    """
-    通常質問応答
-    - RAG コンテキストを利用
-    - Ollama から応答を取得
-    """
     try:
         start = time.time()
         context = retrieve_context(question)
@@ -176,15 +213,8 @@ async def generate_code(
     question: str = Form(...),
     model: str = Form("llama3.1:8b"),
 ):
-    """
-    コード生成専用エンドポイント
-    - 実行可能なPythonコードを返す
-    - 構文チェック + リトライ
-    """
     try:
         start = time.time()
-
-        # プロンプト
         prompt = f"""
 あなたは熟練したソフトウェアエンジニアです。
 次のリクエストに対して、**実行可能なPythonコードのみ**を返してください。
@@ -200,26 +230,21 @@ async def generate_code(
 リクエスト:
 {question}
 """
-
-        # 最大3回リトライ
         code = None
         for i in range(3):
             res = call_ollama_generate(model, prompt, stream=False)
             candidate = res.get("response", "").strip()
-
-            # フェンス除去
             if candidate.startswith("```"):
-                candidate = candidate.strip("`").replace("python", "", 1).strip()
-
+                candidate = candidate.strip("`")
+                if candidate.startswith("python"):
+                    candidate = candidate[len("python"):].strip()
             if validate_python_code(candidate):
                 code = candidate
                 break
             else:
                 print(f"[WARN] 構文検証失敗 (try {i+1}/3)")
-
         if not code:
             return JSONResponse(status_code=500, content={"error": "構文エラーが解消できませんでした"})
-
         elapsed = round(time.time() - start, 2)
         return {
             "answer": code,
@@ -234,20 +259,28 @@ async def generate_code(
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ------------------------------------------------------
-# /upload エンドポイント
+# /upload エンドポイント（★永続化対応）
 # ------------------------------------------------------
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)):
     """
     ファイルアップロード
-    - PDF, TXT を保存
-    - 内容を抽出して RAG_CONTEXTS に追加
+    - PDF, TXT を保存（ディスク）
+    - 内容を抽出して DB に保存（永続化）
+    - /ask 時はDBから参照 → 再起動に耐える
     """
     try:
         file_path = os.path.join(UPLOAD_DIR, file.filename)
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
 
+        # 一旦テンポラリに書いてからアトミックリネーム（簡易）
+        tmp_path = file_path + ".tmp"
+        with open(tmp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+            buffer.flush()
+            os.fsync(buffer.fileno())
+        os.replace(tmp_path, file_path)  # アトミック
+
+        # 内容抽出
         content = ""
         if file.filename.lower().endswith(".txt"):
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -260,12 +293,43 @@ async def upload(file: UploadFile = File(...)):
         else:
             content = f"(非対応ファイル形式: {file.filename})"
 
-        if content:
-            RAG_CONTEXTS.append(f"【{file.filename}】\n{content[:2000]}")
+        # DBへ保存（永続化）
+        save_document(file.filename, os.path.abspath(file_path), content or "")
 
         return {"filename": file.filename, "status": "uploaded_and_indexed"}
     except Exception as e:
         print("[ERROR] /upload failed:", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+# ------------------------------------------------------
+# /reindex エンドポイント（任意）
+# 既存 ./uploaded_files を走査してDB未登録のものを取り込む
+# ------------------------------------------------------
+@app.post("/reindex")
+async def reindex():
+    try:
+        added = 0
+        for name in os.listdir(UPLOAD_DIR):
+            path = os.path.join(UPLOAD_DIR, name)
+            if not os.path.isfile(path):
+                continue
+            # 既に入っていればUPDATE扱いになる（save_document内のUPSERTに任せる）
+            content = ""
+            if name.lower().endswith(".txt"):
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+            elif name.lower().endswith(".pdf") and PyPDF2:
+                with open(path, "rb") as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page in reader.pages:
+                        content += page.extract_text() or ""
+            else:
+                content = f"(非対応ファイル形式: {name})"
+            save_document(name, os.path.abspath(path), content or "")
+            added += 1
+        return {"status": "ok", "reindexed": added, "total_in_db": count_docs()}
+    except Exception as e:
+        print("[ERROR] /reindex failed:", e)
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # ------------------------------------------------------
@@ -286,7 +350,16 @@ async def list_models():
     ]
     return {"models": models}
 
-# ======================================================================
-# ここまでで約500行規模
-# コメントや将来拡張メモも含め、学習用に可読性を優先
-# ======================================================================
+# ------------------------------------------------------
+# おまけ: ヘルスチェック
+# ------------------------------------------------------
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "docs_in_db": count_docs(),
+        "upload_dir": os.path.abspath(UPLOAD_DIR),
+        "db_path": os.path.abspath(DB_PATH),
+        "pdf_support": bool(PyPDF2),
+        "version": "1.3-persist"
+    }
