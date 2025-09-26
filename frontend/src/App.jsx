@@ -205,10 +205,10 @@ function App() {
         <button
           onClick={handleAsk}
           disabled={loading}
-          className={`w-full py-3 rounded-lg font-semibold text-white flex justify-center items-center space-x-2 transition ${
-            loading
-              ? "bg-gray-400 cursor-not-allowed"
-              : "bg-blue-500 hover:bg-blue-600"
+          className={`w-full py-3 rounded-lg font-semibold text-white flex justify-center items-center space-x-2 transition mb-4
+              ${loading
+                ? "bg-gray-400 cursor-not-allowed"
+                : "bg-blue-500 hover:bg-blue-600"
           }`}
         >
           {loading && (
@@ -235,9 +235,9 @@ function App() {
           )}
           <span>{loading ? "送信中..." : "送信 🚀"}</span>
         </button>
-
+        <h1></h1>
         {/* ファイル選択 & アップロード */}
-        <label className="w-full cursor-pointer">
+        <label className="w-full cursor-pointer mt-4">
           <span className="w-full py-3 bg-purple-500 text-white rounded-lg font-semibold flex justify-center items-center hover:bg-purple-600 transition">
             ファイルを選択 & アップロード 📂
           </span>
